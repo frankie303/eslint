@@ -17,6 +17,7 @@
 const assert = require("chai").assert,
     stdAssert = require("assert"),
     { ESLint } = require("../../lib/eslint"),
+    { FlatESLint } = require("../../lib/eslint/flat-eslint"),
     BuiltinRules = require("../../lib/rules"),
     path = require("path"),
     sinon = require("sinon"),
@@ -49,9 +50,10 @@ describe("cli", () => {
      * Verify that ESLint class receives correct opts via await cli.execute().
      * @param {string} cmd CLI command.
      * @param {Object} opts Options hash that should match that received by ESLint class.
+     * @param {string} configType The config type to work with.
      * @returns {void}
      */
-    async function verifyESLintOpts(cmd, opts) {
+    async function verifyESLintOpts(cmd, opts, configType) {
 
         // create a fake ESLint class to test with
         const fakeESLint = sinon.mock().withExactArgs(sinon.match(opts));
@@ -62,10 +64,11 @@ describe("cli", () => {
 
         const localCLI = proxyquire("../../lib/cli", {
             "./eslint": { ESLint: fakeESLint },
+            "./flat-eslint": { FlatESLint: fakeESLint },
             "./shared/logging": log
         });
 
-        await localCLI.execute(cmd);
+        await localCLI.execute(cmd, null, configType === "flat");
         sinon.verifyAndRestore();
     }
 
@@ -105,36 +108,371 @@ describe("cli", () => {
         sh.rm("-r", fixtureDir);
     });
 
-    describe("execute()", () => {
-        it("should return error when text with incorrect quotes is passed as argument", async () => {
-            const configFile = getFixturePath("configurations", "quotes-error.json");
-            const result = await cli.execute(`-c ${configFile}`, "var foo = 'bar';");
+    ["eslintrc", "flat"].forEach(configType => {
 
-            assert.strictEqual(result, 1);
+        const allowFlatConfig = configType === "flat";
+
+        describe("execute()", () => {
+
+            it("should return error when text with incorrect quotes is passed as argument with configType:" + configType, async () => {
+                const configFile = getFixturePath("configurations", "quotes-error.js");
+                const result = await cli.execute(`-c ${configFile} --stdin --stdin-filename foo.js`, "var foo = 'bar';", allowFlatConfig);
+
+                assert.strictEqual(result, 1);
+            });
+
+            it("should not print debug info when passed the empty string as text with configType:" + configType, async () => {
+                const flag = allowFlatConfig ? "--no-config-lookup" : "--no-eslintrc";
+                const result = await cli.execute(["--stdin", flag, "--stdin-filename", "foo.js"], "", allowFlatConfig);
+                
+                assert.strictEqual(result, 0);
+                assert.isTrue(log.info.notCalled);
+            });
+
+            it("should return no error when --ext .js2 is specified with configType:" + configType, async () => {
+                const filePath = getFixturePath("files");
+                const result = await cli.execute(`--ext .js2 ${filePath}`, null, allowFlatConfig);
+
+                assert.strictEqual(result, 0);
+            });
+
+            it("should exit with console error when passed unsupported arguments with configType:" + configType, async () => {
+                const filePath = getFixturePath("files");
+                const result = await cli.execute(`--blah --another ${filePath}`, null, allowFlatConfig);
+
+                assert.strictEqual(result, 2);
+            });
+
         });
 
-        it("should not print debug info when passed the empty string as text", async () => {
-            const result = await cli.execute(["--stdin", "--no-eslintrc"], "");
+        describe("when given a config with rules with options and severity level set to error", () => {
 
-            assert.strictEqual(result, 0);
-            assert.isTrue(log.info.notCalled);
+            const originalCwd = process.cwd;
+
+            beforeEach(() => {
+                process.cwd = () => getFixturePath();
+            });
+
+            afterEach(() => {
+                process.cwd = originalCwd;
+            });
+            
+            it("should exit with an error status (1) with configType:" + configType, async () => {
+                const configPath = getFixturePath("configurations", "quotes-error.js");
+                const filePath = getFixturePath("single-quoted.js");
+                const code = `--no-ignore --config ${configPath} ${filePath}`;
+
+                const exitStatus = await cli.execute(code, null, allowFlatConfig);
+
+                assert.strictEqual(exitStatus, 1);
+            });
         });
 
-        it("should return no error when --ext .js2 is specified", async () => {
-            const filePath = getFixturePath("files");
-            const result = await cli.execute(`--ext .js2 ${filePath}`);
+        describe("when given a config file and a directory of files", () => {
+            it("should load and execute without error with configType:" + configType, async () => {
+                const configPath = getFixturePath("configurations", "semi-error.js");
+                const filePath = getFixturePath("formatters");
+                const code = `--config ${configPath} ${filePath}`;
+                const exitStatus = await cli.execute(code, null, allowFlatConfig);
 
-            assert.strictEqual(result, 0);
+                assert.strictEqual(exitStatus, 0);
+            });
         });
 
-        it("should exit with console error when passed unsupported arguments", async () => {
-            const filePath = getFixturePath("files");
-            const result = await cli.execute(`--blah --another ${filePath}`);
+        describe("when there is a local config file", () => {
+            const code = "lib/cli.js";
 
-            assert.strictEqual(result, 2);
+            it("should load the local config file with configType:" + configType, async () => {
+                await cli.execute(code, null, allowFlatConfig);
+            });
+        });
+
+        describe("Formatters", () => {
+
+            describe("when given a valid built-in formatter name", () => {
+                it("should execute without any errors with configType:" + configType, async () => {
+                    const filePath = getFixturePath("passing.js");
+                    const exit = await cli.execute(`-f checkstyle ${filePath}`, null, allowFlatConfig);
+
+                    assert.strictEqual(exit, 0);
+                });
+            });
+
+            describe("when given a valid built-in formatter name that uses rules meta.", () => {
+                
+                const originalCwd = process.cwd;
+
+                beforeEach(() => {
+                    process.cwd = () => getFixturePath();
+                });
+
+                afterEach(() => {
+                    process.cwd = originalCwd;
+                });
+
+                it("should execute without any errors with configType:" + configType, async () => {
+                    const filePath = getFixturePath("passing.js");
+                    const flag = allowFlatConfig ? "--no-config-lookup" : "--no-eslintrc";
+                    const exit = await cli.execute(`--no-ignore -f json-with-metadata ${filePath} ${flag}`, null, allowFlatConfig);
+
+                    assert.strictEqual(exit, 0);
+
+                    /*
+                     * Note: There is a behavior difference between eslintrc and flat config
+                     * when using formatters. For eslintrc, rulesMeta always contains every
+                     * rule that was loaded during the last run; for flat config, rulesMeta
+                     * only contains meta data for the rules that triggered messages in the
+                     * results. (Flat config uses ESLint#getRulesMetaForResults().)
+                     */
+
+                    // Check metadata.
+                    const { metadata } = JSON.parse(log.info.args[0][0]);
+                    const expectedMetadata = {
+                        cwd: process.cwd(),
+                        rulesMeta: allowFlatConfig ? {} : Array.from(BuiltinRules).reduce((obj, [ruleId, rule]) => {
+                            obj[ruleId] = rule.meta;
+                            return obj;
+                        }, {})
+                    };
+
+                    assert.deepStrictEqual(metadata, expectedMetadata);
+                });
+            });
+
+            describe("when given an invalid built-in formatter name", () => {
+                it("should execute with error: with configType:" + configType, async () => {
+                    const filePath = getFixturePath("passing.js");
+                    const exit = await cli.execute(`-f fakeformatter ${filePath}`);
+
+                    assert.strictEqual(exit, 2);
+                });
+            });
+
+            describe("when given a valid formatter path", () => {
+                it("should execute without any errors with configType:" + configType, async () => {
+                    const formatterPath = getFixturePath("formatters", "simple.js");
+                    const filePath = getFixturePath("passing.js");
+                    const exit = await cli.execute(`-f ${formatterPath} ${filePath}`);
+
+                    assert.strictEqual(exit, 0);
+                });
+            });
+
+            describe("when given an invalid formatter path", () => {
+                it("should execute with error with configType:" + configType, async () => {
+                    const formatterPath = getFixturePath("formatters", "file-does-not-exist.js");
+                    const filePath = getFixturePath("passing.js");
+                    const exit = await cli.execute(`-f ${formatterPath} ${filePath}`, null, allowFlatConfig);
+
+                    assert.strictEqual(exit, 2);
+                });
+            });
+
+            describe("when given an async formatter path", () => {
+                it("should execute without any errors with configType:" + configType, async () => {
+                    const formatterPath = getFixturePath("formatters", "async.js");
+                    const filePath = getFixturePath("passing.js");
+                    const exit = await cli.execute(`-f ${formatterPath} ${filePath}`);
+
+                    assert.strictEqual(log.info.getCall(0).args[0], "from async formatter");
+                    assert.strictEqual(exit, 0);
+                });
+            });
+        });
+
+        describe("Exit Codes", () => {
+    
+            const originalCwd = process.cwd;
+
+            beforeEach(() => {
+                process.cwd = () => getFixturePath();
+            });
+
+            afterEach(() => {
+                process.cwd = originalCwd;
+            });
+
+            describe("when executing a file with a lint error", () => {
+        
+                it("should exit with error with configType:" + configType, async () => {
+                    const filePath = getFixturePath("undef.js");
+                    const code = `--no-ignore --rule no-undef:2 ${filePath}`;
+    
+                    const exit = await cli.execute(code, null, allowFlatConfig);
+    
+                    assert.strictEqual(exit, 1);
+                });
+            });
+    
+            describe("when using --fix-type without --fix or --fix-dry-run", () => {
+                it("should exit with error with configType:" + configType, async () => {
+                    const filePath = getFixturePath("passing.js");
+                    const code = `--fix-type suggestion ${filePath}`;
+    
+                    const exit = await cli.execute(code, null, allowFlatConfig);
+    
+                    assert.strictEqual(exit, 2);
+                });
+            });
+    
+            describe("when executing a file with a syntax error", () => {
+                it("should exit with error with configType:" + configType, async () => {
+                    const filePath = getFixturePath("syntax-error.js");
+                    const exit = await cli.execute(`--no-ignore ${filePath}`, null, allowFlatConfig);
+    
+                    assert.strictEqual(exit, 1);
+                });
+            });
+
+        });
+
+        describe("when calling execute more than once", () => {
+
+            const originalCwd = process.cwd;
+
+            beforeEach(() => {
+                process.cwd = () => getFixturePath();
+            });
+
+            afterEach(() => {
+                process.cwd = originalCwd;
+            });
+
+            it("should not print the results from previous execution with configType:" + configType, async () => {
+                const filePath = getFixturePath("missing-semicolon.js");
+                const passingPath = getFixturePath("passing.js");
+
+                await cli.execute(`--no-ignore --rule semi:2 ${filePath}`, null, allowFlatConfig);
+
+                assert.isTrue(log.info.called, "Log should have been called.");
+
+                log.info.resetHistory();
+
+                await cli.execute(`--no-ignore --rule semi:2 ${passingPath}`, null, allowFlatConfig);
+                assert.isTrue(log.info.notCalled);
+
+            });
+        });
+
+        describe("when executing with version flag", () => {
+            it("should print out current version with configType:" + configType, async () => {
+                assert.strictEqual(await cli.execute("-v", null, allowFlatConfig), 0);
+                assert.strictEqual(log.info.callCount, 1);
+            });
+        });
+
+        describe("when executing with env-info flag", () => {
+            
+            it("should print out environment information with configType:" + configType, async () => {
+                assert.strictEqual(await cli.execute("--env-info", null, allowFlatConfig), 0);
+                assert.strictEqual(log.info.callCount, 1);
+            });
+
+            describe("With error condition", () => {
+
+                beforeEach(() => {
+                    RuntimeInfo.environment = sinon.stub().throws("There was an error!");
+                });
+
+                afterEach(() => {
+                    RuntimeInfo.environment = sinon.stub();
+                });
+
+                it("should print error message and return error code with configType:" + configType, async () => {
+    
+                    assert.strictEqual(await cli.execute("--env-info", null, allowFlatConfig), 2);
+                    assert.strictEqual(log.error.callCount, 1);
+                });
+            });
+
+        });
+
+
+
+        describe("no-error-on-unmatched-pattern flag", () => {
+
+            const originalCwd = process.cwd;
+
+            beforeEach(() => {
+                process.cwd = () => getFixturePath();
+            });
+
+            afterEach(() => {
+                process.cwd = originalCwd;
+            });
+
+            describe("when executing without no-error-on-unmatched-pattern flag", () => {
+                it("should throw an error on unmatched glob pattern with configType:" + configType, async () => {
+                    const filePath = getFixturePath("unmatched-patterns");
+                    const globPattern = "*.js3";
+
+                    await stdAssert.rejects(async () => {
+                        await cli.execute(`"${filePath}/${globPattern}"`, null, allowFlatConfig);
+                    }, new Error(`No files matching '${filePath}/${globPattern}' were found.`));
+                });
+
+                it("should throw an error on unmatched --ext with configType:" + configType, async () => {
+                    const filePath = getFixturePath("unmatched-patterns");
+                    const extension = ".js3";
+
+                    await stdAssert.rejects(async () => {
+                        await cli.execute(`--ext ${extension} ${filePath}`, null, allowFlatConfig);
+                    }, `No files matching '${filePath}' were found`);
+                });
+            });
+
+            describe("when executing with no-error-on-unmatched-pattern flag", () => {
+                it("should not throw an error on unmatched node glob syntax patterns with configType:" + configType, async () => {
+                    const filePath = getFixturePath("unmatched-patterns");
+                    const exit = await cli.execute(`--no-error-on-unmatched-pattern "${filePath}/*.js3"`, null, allowFlatConfig);
+
+                    assert.strictEqual(exit, 0);
+                });
+
+                it("should not throw an error on unmatched --ext with configType:" + configType, async () => {
+                    const filePath = getFixturePath("unmatched-patterns/js3");
+                    const exit = await cli.execute(`--no-ignore --no-error-on-unmatched-pattern --ext .js3 ${filePath}`, null, allowFlatConfig);
+
+                    assert.strictEqual(exit, 0);
+                });
+            });
+
+            describe("when executing with no-error-on-unmatched-pattern flag and multiple patterns", () => {
+                it("should not throw an error on multiple unmatched node glob syntax patterns with configType:" + configType, async () => {
+                    const filePath = getFixturePath("unmatched-patterns/js3");
+                    const exit = await cli.execute(`--no-error-on-unmatched-pattern ${filePath}/*.js3 ${filePath}/*.js4`, null, allowFlatConfig);
+
+                    assert.strictEqual(exit, 0);
+                });
+
+                it("should still throw an error on when a matched pattern has lint errors with configType:" + configType, async () => {
+                    const filePath = getFixturePath("unmatched-patterns");
+                    const exit = await cli.execute(`--no-error-on-unmatched-pattern ${filePath}/*.js3 ${filePath}/*.js`, null, allowFlatConfig);
+
+                    assert.strictEqual(exit, 1);
+                });
+            });
+
+            describe("when executing with no-error-on-unmatched-pattern flag and multiple --ext arguments", () => {
+                it("should not throw an error on multiple unmatched --ext arguments with configType:" + configType, async () => {
+                    const filePath = getFixturePath("unmatched-patterns");
+                    const exit = await cli.execute(`--no-error-on-unmatched-pattern --ext .js3 --ext .js4 ${filePath}`, null, allowFlatConfig);
+
+                    assert.strictEqual(exit, 0);
+                });
+
+                it("should still throw an error on when a matched pattern has lint errors with configType:" + configType, async () => {
+                    const filePath = getFixturePath("unmatched-patterns");
+                    const exit = await cli.execute(`--no-error-on-unmatched-pattern --ext .js3 --ext .js ${filePath}`, null, allowFlatConfig);
+
+                    assert.strictEqual(exit, 1);
+                });
+            });
+
         });
 
     });
+
 
     describe("when given a config file", () => {
         it("should load the specified config file", async () => {
@@ -145,299 +483,58 @@ describe("cli", () => {
         });
     });
 
-    describe("when there is a local config file", () => {
-        const code = "lib/cli.js";
+    describe("Environments", () => {
 
-        it("should load the local config file", async () => {
+        describe("when given a config with environment set to browser", () => {
+            it("should execute without any errors", async () => {
+                const configPath = getFixturePath("configurations", "env-browser.json");
+                const filePath = getFixturePath("globals-browser.js");
+                const code = `--config ${configPath} ${filePath}`;
 
-            // Mock CWD
-            process.eslintCwd = getFixturePath("configurations", "single-quotes");
+                const exit = await cli.execute(code);
 
-            await cli.execute(code);
+                assert.strictEqual(exit, 0);
+            });
+        });
 
-            process.eslintCwd = null;
+        describe("when given a config with environment set to Node.js", () => {
+            it("should execute without any errors", async () => {
+                const configPath = getFixturePath("configurations", "env-node.json");
+                const filePath = getFixturePath("globals-node.js");
+                const code = `--config ${configPath} ${filePath}`;
+
+                const exit = await cli.execute(code);
+
+                assert.strictEqual(exit, 0);
+            });
+        });
+
+        describe("when given a config with environment set to Nashorn", () => {
+            it("should execute without any errors", async () => {
+                const configPath = getFixturePath("configurations", "env-nashorn.json");
+                const filePath = getFixturePath("globals-nashorn.js");
+                const code = `--config ${configPath} ${filePath}`;
+
+                const exit = await cli.execute(code);
+
+                assert.strictEqual(exit, 0);
+            });
+        });
+
+        describe("when given a config with environment set to WebExtensions", () => {
+            it("should execute without any errors", async () => {
+                const configPath = getFixturePath("configurations", "env-webextensions.json");
+                const filePath = getFixturePath("globals-webextensions.js");
+                const code = `--config ${configPath} ${filePath}`;
+
+                const exit = await cli.execute(code);
+
+                assert.strictEqual(exit, 0);
+            });
         });
     });
 
-    describe("when given a config with rules with options and severity level set to error", () => {
-        it("should exit with an error status (1)", async () => {
-            const configPath = getFixturePath("configurations", "quotes-error.json");
-            const filePath = getFixturePath("single-quoted.js");
-            const code = `--no-ignore --config ${configPath} ${filePath}`;
-
-            const exitStatus = await cli.execute(code);
-
-            assert.strictEqual(exitStatus, 1);
-        });
-    });
-
-    describe("when given a config file and a directory of files", () => {
-        it("should load and execute without error", async () => {
-            const configPath = getFixturePath("configurations", "semi-error.json");
-            const filePath = getFixturePath("formatters");
-            const code = `--config ${configPath} ${filePath}`;
-
-            const exitStatus = await cli.execute(code);
-
-            assert.strictEqual(exitStatus, 0);
-        });
-    });
-
-    describe("when given a config with environment set to browser", () => {
-        it("should execute without any errors", async () => {
-            const configPath = getFixturePath("configurations", "env-browser.json");
-            const filePath = getFixturePath("globals-browser.js");
-            const code = `--config ${configPath} ${filePath}`;
-
-            const exit = await cli.execute(code);
-
-            assert.strictEqual(exit, 0);
-        });
-    });
-
-    describe("when given a config with environment set to Node.js", () => {
-        it("should execute without any errors", async () => {
-            const configPath = getFixturePath("configurations", "env-node.json");
-            const filePath = getFixturePath("globals-node.js");
-            const code = `--config ${configPath} ${filePath}`;
-
-            const exit = await cli.execute(code);
-
-            assert.strictEqual(exit, 0);
-        });
-    });
-
-    describe("when given a config with environment set to Nashorn", () => {
-        it("should execute without any errors", async () => {
-            const configPath = getFixturePath("configurations", "env-nashorn.json");
-            const filePath = getFixturePath("globals-nashorn.js");
-            const code = `--config ${configPath} ${filePath}`;
-
-            const exit = await cli.execute(code);
-
-            assert.strictEqual(exit, 0);
-        });
-    });
-
-    describe("when given a config with environment set to WebExtensions", () => {
-        it("should execute without any errors", async () => {
-            const configPath = getFixturePath("configurations", "env-webextensions.json");
-            const filePath = getFixturePath("globals-webextensions.js");
-            const code = `--config ${configPath} ${filePath}`;
-
-            const exit = await cli.execute(code);
-
-            assert.strictEqual(exit, 0);
-        });
-    });
-
-    describe("when given a valid built-in formatter name", () => {
-        it("should execute without any errors", async () => {
-            const filePath = getFixturePath("passing.js");
-            const exit = await cli.execute(`-f checkstyle ${filePath}`);
-
-            assert.strictEqual(exit, 0);
-        });
-    });
-
-    describe("when given a valid built-in formatter name that uses rules meta.", () => {
-        it("should execute without any errors", async () => {
-            const filePath = getFixturePath("passing.js");
-            const exit = await cli.execute(`-f json-with-metadata ${filePath} --no-eslintrc`);
-
-            assert.strictEqual(exit, 0);
-
-            // Check metadata.
-            const { metadata } = JSON.parse(log.info.args[0][0]);
-            const expectedMetadata = {
-                cwd: process.cwd(),
-                rulesMeta: Array.from(BuiltinRules).reduce((obj, [ruleId, rule]) => {
-                    obj[ruleId] = rule.meta;
-                    return obj;
-                }, {})
-            };
-
-            assert.deepStrictEqual(metadata, expectedMetadata);
-        });
-    });
-
-    describe("when given an invalid built-in formatter name", () => {
-        it("should execute with error", async () => {
-            const filePath = getFixturePath("passing.js");
-            const exit = await cli.execute(`-f fakeformatter ${filePath}`);
-
-            assert.strictEqual(exit, 2);
-        });
-    });
-
-    describe("when given a valid formatter path", () => {
-        it("should execute without any errors", async () => {
-            const formatterPath = getFixturePath("formatters", "simple.js");
-            const filePath = getFixturePath("passing.js");
-            const exit = await cli.execute(`-f ${formatterPath} ${filePath}`);
-
-            assert.strictEqual(exit, 0);
-        });
-    });
-
-    describe("when given an invalid formatter path", () => {
-        it("should execute with error", async () => {
-            const formatterPath = getFixturePath("formatters", "file-does-not-exist.js");
-            const filePath = getFixturePath("passing.js");
-            const exit = await cli.execute(`-f ${formatterPath} ${filePath}`);
-
-            assert.strictEqual(exit, 2);
-        });
-    });
-
-    describe("when given an async formatter path", () => {
-        it("should execute without any errors", async () => {
-            const formatterPath = getFixturePath("formatters", "async.js");
-            const filePath = getFixturePath("passing.js");
-            const exit = await cli.execute(`-f ${formatterPath} ${filePath}`);
-
-            assert.strictEqual(log.info.getCall(0).args[0], "from async formatter");
-            assert.strictEqual(exit, 0);
-        });
-    });
-
-    describe("when executing a file with a lint error", () => {
-        it("should exit with error", async () => {
-            const filePath = getFixturePath("undef.js");
-            const code = `--no-ignore --rule no-undef:2 ${filePath}`;
-
-            const exit = await cli.execute(code);
-
-            assert.strictEqual(exit, 1);
-        });
-    });
-
-    describe("when using --fix-type without --fix or --fix-dry-run", () => {
-        it("should exit with error", async () => {
-            const filePath = getFixturePath("passing.js");
-            const code = `--fix-type suggestion ${filePath}`;
-
-            const exit = await cli.execute(code);
-
-            assert.strictEqual(exit, 2);
-        });
-    });
-
-    describe("when executing a file with a syntax error", () => {
-        it("should exit with error", async () => {
-            const filePath = getFixturePath("syntax-error.js");
-            const exit = await cli.execute(`--no-ignore ${filePath}`);
-
-            assert.strictEqual(exit, 1);
-        });
-    });
-
-    describe("when calling execute more than once", () => {
-        it("should not print the results from previous execution", async () => {
-            const filePath = getFixturePath("missing-semicolon.js");
-            const passingPath = getFixturePath("passing.js");
-
-            await cli.execute(`--no-ignore --rule semi:2 ${filePath}`);
-
-            assert.isTrue(log.info.called, "Log should have been called.");
-
-            log.info.resetHistory();
-
-            await cli.execute(`--no-ignore --rule semi:2 ${passingPath}`);
-            assert.isTrue(log.info.notCalled);
-
-        });
-    });
-
-    describe("when executing with version flag", () => {
-        it("should print out current version", async () => {
-            assert.strictEqual(await cli.execute("-v"), 0);
-            assert.strictEqual(log.info.callCount, 1);
-        });
-    });
-
-    describe("when executing with env-info flag", () => {
-        it("should print out environment information", async () => {
-            assert.strictEqual(await cli.execute("--env-info"), 0);
-            assert.strictEqual(log.info.callCount, 1);
-        });
-
-        it("should print error message and return error code", async () => {
-            RuntimeInfo.environment.throws("There was an error!");
-
-            assert.strictEqual(await cli.execute("--env-info"), 2);
-            assert.strictEqual(log.error.callCount, 1);
-        });
-    });
-
-    describe("when executing without no-error-on-unmatched-pattern flag", () => {
-        it("should throw an error on unmatched glob pattern", async () => {
-            const filePath = getFixturePath("unmatched-patterns");
-            const globPattern = "*.js3";
-
-            await stdAssert.rejects(async () => {
-                await cli.execute(`"${filePath}/${globPattern}"`);
-            }, new Error(`No files matching '${filePath}/${globPattern}' were found.`));
-        });
-
-        it("should throw an error on unmatched --ext", async () => {
-            const filePath = getFixturePath("unmatched-patterns");
-            const extension = ".js3";
-
-            await stdAssert.rejects(async () => {
-                await cli.execute(`--ext ${extension} ${filePath}`);
-            }, `No files matching '${filePath}' were found`);
-        });
-    });
-
-    describe("when executing with no-error-on-unmatched-pattern flag", () => {
-        it("should not throw an error on unmatched node glob syntax patterns", async () => {
-            const filePath = getFixturePath("unmatched-patterns");
-            const exit = await cli.execute(`--no-error-on-unmatched-pattern "${filePath}/*.js3"`);
-
-            assert.strictEqual(exit, 0);
-        });
-
-        it("should not throw an error on unmatched --ext", async () => {
-            const filePath = getFixturePath("unmatched-patterns");
-            const exit = await cli.execute(`--no-error-on-unmatched-pattern --ext .js3 ${filePath}`);
-
-            assert.strictEqual(exit, 0);
-        });
-    });
-
-    describe("when executing with no-error-on-unmatched-pattern flag and multiple patterns", () => {
-        it("should not throw an error on multiple unmatched node glob syntax patterns", async () => {
-            const filePath = getFixturePath("unmatched-patterns");
-            const exit = await cli.execute(`--no-error-on-unmatched-pattern ${filePath}/*.js3 ${filePath}/*.js4`);
-
-            assert.strictEqual(exit, 0);
-        });
-
-        it("should still throw an error on when a matched pattern has lint errors", async () => {
-            const filePath = getFixturePath("unmatched-patterns");
-            const exit = await cli.execute(`--no-error-on-unmatched-pattern ${filePath}/*.js3 ${filePath}/*.js`);
-
-            assert.strictEqual(exit, 1);
-        });
-    });
-
-    describe("when executing with no-error-on-unmatched-pattern flag and multiple --ext arguments", () => {
-        it("should not throw an error on multiple unmatched --ext arguments", async () => {
-            const filePath = getFixturePath("unmatched-patterns");
-            const exit = await cli.execute(`--no-error-on-unmatched-pattern --ext .js3 --ext .js4 ${filePath}`);
-
-            assert.strictEqual(exit, 0);
-        });
-
-        it("should still throw an error on when a matched pattern has lint errors", async () => {
-            const filePath = getFixturePath("unmatched-patterns");
-            const exit = await cli.execute(`--no-error-on-unmatched-pattern --ext .js3 --ext .js ${filePath}`);
-
-            assert.strictEqual(exit, 1);
-        });
-    });
-
+    
     describe("when executing with help flag", () => {
         it("should print out help", async () => {
             assert.strictEqual(await cli.execute("-h"), 0);
@@ -723,17 +820,22 @@ describe("cli", () => {
     });
 
     describe("when given an parser name", () => {
-        it("should exit with a fatal error if parser is invalid", async () => {
-            const filePath = getFixturePath("passing.js");
+        
+        ["eslintrc", "flat"].forEach(configType => {
 
-            await stdAssert.rejects(async () => await cli.execute(`--no-ignore --parser test111 ${filePath}`), "Cannot find module 'test111'");
-        });
+            it("should exit with a fatal error if parser is invalid with configType:" + configType, async () => {
+                const filePath = getFixturePath("passing.js");
 
-        it("should exit with no error if parser is valid", async () => {
-            const filePath = getFixturePath("passing.js");
-            const exit = await cli.execute(`--no-ignore --parser espree ${filePath}`);
+                await stdAssert.rejects(async () => await cli.execute(`--no-ignore --parser test111 ${filePath}`, void 0, configType === "flat"), "Cannot find module 'test111'");
+            });
 
-            assert.strictEqual(exit, 0);
+            it("should exit with no error if parser is valid with configType:" + configType, async () => {
+                const filePath = getFixturePath("passing.js");
+                const exit = await cli.execute(`--no-ignore --parser espree ${filePath}`, null, configType === "flat");
+
+                assert.strictEqual(exit, 0);
+            });
+
         });
     });
 
